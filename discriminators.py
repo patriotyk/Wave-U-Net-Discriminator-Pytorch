@@ -22,8 +22,7 @@ class ResBlockDown(nn.Module):
 
     Args:
         in_ch:  number of input channels
-        out_ch: number of output channels per path;
-                total output = 2 × out_ch after Concat
+        out_ch: number of output channels per path
     """
 
     def __init__(self, in_ch: int, out_ch: int):
@@ -32,7 +31,7 @@ class ResBlockDown(nn.Module):
         self.out_ch = out_ch
 
         self.skip_pool = nn.AvgPool1d(kernel_size=3, stride=3)
-        self.skip_conv = nn.Conv1d(in_ch, out_ch, kernel_size=1)
+        self.skip_conv = nn.Conv1d(in_ch, out_ch - in_ch, kernel_size=1)
 
         self.lrelu1 = nn.LeakyReLU(negative_slope=0.1)
         self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size=6, stride=3, padding=2)
@@ -53,20 +52,22 @@ class ResBlockDown(nn.Module):
         return x.repeat(1, reps, 1)[:, :self.out_ch, :]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        skip = self.skip_pool(x)
-        skip = self.skip_conv(skip)
+        pool = self.skip_pool(x)
+        skip = self.skip_conv(pool)
+        skip = torch.cat([pool, skip], dim=1)
 
-        r = self.lrelu1(x)
-        r = self.conv1(r)
 
-        sc = self.res_pool(x)
+        res = self.lrelu1(x)
+        r = self.conv1(res)
+
+        sc = self.res_pool(res)
         sc = self._dup_channels(sc)
 
         r = r + sc
         r = self.lrelu2(r)
         r = self.conv2(r)
 
-        out = torch.cat([skip, r * 0.4], dim=1)
+        out = skip + (r * 0.4)
         return self.norm(out)
 
 
@@ -100,27 +101,28 @@ class ResBlockUp(nn.Module):
 
     @staticmethod
     def _upsample(x: torch.Tensor, factor: int = 3) -> torch.Tensor:
-        return F.interpolate(x, scale_factor=factor, mode="linear", align_corners=False)
+        return x.repeat_interleave(factor, dim=2)
 
     def _drop_channels(self, x: torch.Tensor) -> torch.Tensor:
         return x[:, :self.out_ch, :]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        skip = self._upsample(x)
-        skip = self.skip_conv(skip)
+        skip = self.skip_conv(x)
+        skip = self._upsample(skip)
 
-        r = self.lrelu1(x)
-        r = self.convt(r)
+        res = self.lrelu1(x)
+        r = self.convt(res)
 
-        sc = self._upsample(x)
+        sc = self._upsample(res)
         sc = self._drop_channels(sc)
 
         r = r + sc
         r = self.lrelu2(r)
         r = self.conv2(r)
 
-        out = torch.cat([skip, r * 0.4], dim=1)
+        out = skip + (r * 0.4)
         return self.norm(out)
+
 
 
 class WaveUNetDiscriminator(nn.Module):
@@ -128,18 +130,18 @@ class WaveUNetDiscriminator(nn.Module):
         super().__init__()
 
         self.enc1 = ResBlockDown(in_ch=1,    out_ch=32)
-        self.enc2 = ResBlockDown(in_ch=64,   out_ch=64)
-        self.enc3 = ResBlockDown(in_ch=128,  out_ch=128)
-        self.enc4 = ResBlockDown(in_ch=256,  out_ch=256)
-        self.enc5 = ResBlockDown(in_ch=512,  out_ch=512)
+        self.enc2 = ResBlockDown(in_ch=32,   out_ch=64)
+        self.enc3 = ResBlockDown(in_ch=64,   out_ch=128)
+        self.enc4 = ResBlockDown(in_ch=128,  out_ch=256)
+        self.enc5 = ResBlockDown(in_ch=256,  out_ch=512)
 
-        self.dec1 = ResBlockUp(in_ch=1024, out_ch=256)
-        self.dec2 = ResBlockUp(in_ch=1024, out_ch=128)
-        self.dec3 = ResBlockUp(in_ch=512,  out_ch=64)
-        self.dec4 = ResBlockUp(in_ch=256,  out_ch=32)
-        self.dec5 = ResBlockUp(in_ch=128,  out_ch=32)
+        self.dec1 = ResBlockUp(in_ch=512, out_ch=256)
+        self.dec2 = ResBlockUp(in_ch=512, out_ch=128)
+        self.dec3 = ResBlockUp(in_ch=256,  out_ch=64)
+        self.dec4 = ResBlockUp(in_ch=128,  out_ch=32)
+        self.dec5 = ResBlockUp(in_ch=64,  out_ch=32)
 
-        self.out_conv = nn.Conv1d(64, 1, kernel_size=5, stride=1, padding=2)
+        self.out_conv = nn.Conv1d(32, 1, kernel_size=5, stride=1, padding=2)
 
     def pad_to_multiple(self, x: torch.Tensor, multiple: int = 243) -> tuple[torch.Tensor, int]:
         T = x.shape[-1]
@@ -150,9 +152,7 @@ class WaveUNetDiscriminator(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        return_features: bool = False,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, list[torch.Tensor]]]:
-        
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         x, pad = self.pad_to_multiple(x)
         e1 = self.enc1(x)
         e2 = self.enc2(e1)
@@ -169,9 +169,6 @@ class WaveUNetDiscriminator(nn.Module):
         logits = self.out_conv(d5)
         if pad > 0:
             logits = logits[..., :-pad]
-
-        if not return_features:
-            return logits
 
         features = [e1, e2, e3, e4, e5, d1, d2, d3, d4, d5]
         return logits, features
